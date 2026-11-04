@@ -520,6 +520,7 @@ label.sim-check.small { display: flex; gap: 6px; align-items: flex-start; font-w
     <div class="pill" data-open="staff" title="Staff on site / hired"><span class="ico">👩‍🔬</span><span id="tb-staff">—</span></div>
     <div class="pill" data-open="orders" title="Customer orders"><span class="ico">📋</span><span id="tb-orders">—</span></div>
     <div class="spacer"></div>
+    <div class="pill sim-pill" data-act="sim-open" title="Simulation mode: compare two lab set-ups on the same orders">🔬<span class="brand-name">Simulate</span></div>
     <div class="pill icon-only" data-open="game" title="Save / load / new game">💾</div>
   </header>
 
@@ -545,12 +546,14 @@ label.sim-check.small { display: flex; gap: 6px; align-items: flex-start; font-w
   </nav>
 
   <aside id="panel" class="panel hidden" aria-live="polite"></aside>
+  <aside id="dock" class="panel hidden"></aside>
   <aside id="inspector" class="panel hidden"></aside>
   <div id="tutorial" class="hidden"></div>
   <div id="toasts"></div>
   <div id="tooltip" class="hidden"></div>
   <div id="ptip" class="hidden"></div>
   <div id="buildhint" class="hidden"></div>
+  <div id="simview" class="hidden"></div>
   <div id="modal" class="hidden"></div>
   <div id="loading"><div class="spinner">🧬</div><div>Loading NGS Fever…</div><div class="muted small" id="loading-msg"></div></div>
 </div>
@@ -1389,7 +1392,7 @@ function monthTotals(key) {
 
 // ---------- persistence ----------
 function saveGame(silent = false) {
-  if (S.preview) return false;   // the demo lab behind the first-run menu
+  if (S.preview || S.sim) return false;   // the demo lab behind the first-run menu, simulation-mode labs
   try {
     S.kitKeys = kitKeys();
     localStorage.setItem(SAVE_KEY, JSON.stringify(S));
@@ -2961,7 +2964,8 @@ function prepReadyAt(o) {
 }
 
 // When would `gb` of order o finish sequencing on inst with kit kitIdx, if libraries are ready at readyAt?
-function forecastSeq(o, inst, kitIdx, readyAt, gb) {
+// `out` (optional) collects the batches it would book, for the queue preview: {pool: runId} or a bookRun() result.
+function forecastSeq(o, inst, kitIdx, readyAt, gb, out = null) {
   if (!isFinite(readyAt)) return Infinity;
   const sch = schedule(), def = INST[inst.key], kit = def.kits[kitIdx];
   const t0 = sch.timelines.get(inst.id);
@@ -2976,15 +2980,24 @@ function forecastSeq(o, inst, kitIdx, readyAt, gb) {
     if (room <= 1e-6) continue;
     const p = sch.runs.get(r.id);
     end = Math.max(end, p && p.cStart >= readyAt ? p.end : readyAt + condHours(def, kitIdx) + seqHours(def, kitIdx));
+    if (out) out.push({ pool: r.id, gb: Math.min(room, left) });
     left -= Math.min(room, left);
   }
   const runs = Math.ceil(Math.max(0, left) / kit.yieldGb - 1e-9);
   for (let k = 0; k < runs; k++) {
     const b = bookRun(tl, def, kitIdx, readyAt);
     if (!b) return Infinity;
+    if (out) out.push({ ...b, gb: Math.min(kit.yieldGb, left - k * kit.yieldGb) });
     end = Math.max(end, b.end);
   }
   return end;
+}
+// The batches order o would add to inst's queue with kit kitIdx (queue preview).
+function previewBatches(o, inst, kitIdx) {
+  const out = [];
+  const gb = o.status === 'offer' ? o.gb : gbToSequence(o);
+  const end = forecastSeq(o, inst, kitIdx, prepReadyAt(o), gb, out);
+  return { batches: out, end, ready: isFinite(end) ? end + analysisHours(o.gb) : Infinity };
 }
 
 // Expected outcome of doing order o on inst with option opt (from kitOptions).
@@ -5042,7 +5055,7 @@ function toScreen(x, y, z) {
   return { x: (_v3.x + 1) / 2 * window.innerWidth, y: (1 - _v3.y) / 2 * window.innerHeight, behind: _v3.z > 1 };
 }
 function floatText(pos, text, cls = 'info', dy = 0) {
-  if (!R.camera) return;
+  if (!R.camera || S.sim) return;
   const el = document.createElement('div');
   el.className = 'floater ' + cls;
   el.textContent = text;
@@ -8007,6 +8020,7 @@ function wireInput() {
   });
   window.addEventListener('keydown', e => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+    if (SIMV.open) { if (e.key === 'Escape' && !SIMV.run) closeSimMode(); return; }
     if (!$('#modal').classList.contains('hidden')) return;
     const k = e.key.toLowerCase();
     if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'q', 'e'].includes(k)) { KEYS.add(k); if (k.startsWith('arrow')) e.preventDefault(); return; }
@@ -8054,7 +8068,7 @@ function loop(now) {
   frame(dt);
 }
 function frame(dt) {
-  if (!S) return;
+  if (!S || SIMV.open) return;   // the game pauses (and stops drawing) while simulation mode is open
   try {
     if (!S.gameOver && $('#modal').classList.contains('hidden')) {
       let mult = SPEEDS[S.speed] || 0;
@@ -8138,7 +8152,7 @@ window.NGS = {
   get S() { return S; }, simulate, placeObject, acceptOrder, assignOrder, hireCandidate, plugIn, kitOptions, bestAssignment,
   expandLab, canPlace, removeObject, openPanel, setSpeed, startNewGame, NEWGAME, generateOrder, select, markDirty, focusOn,
   frames(n = 1, dt = 1 / 60) { for (let i = 0; i < n; i++) frame(dt); },
-  get R() { return R; }, get UI() { return UI; }, TOUCH, longPress, cancelMode, thumbnail, INST, pickAt, loadState, EQUIP, KITS, stockKit, labBoost,
+  get R() { return R; }, get UI() { return UI; }, SIMV, openSimMode, TOUCH, longPress, cancelMode, thumbnail, INST, pickAt, loadState, EQUIP, KITS, stockKit, labBoost,
 };
 init();
 
